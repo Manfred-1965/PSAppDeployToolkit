@@ -1,4 +1,4 @@
-﻿<#
+<#
 
 .SYNOPSIS
 PSAppDeployToolkit - This script performs the installation or uninstallation of an application(s).
@@ -79,27 +79,25 @@ param
     [System.Management.Automation.SwitchParameter]$DisableLogging
 )
 
-
 ##================================================
 ## MARK: Variables
 ##================================================
 
-# Zero-Config MSI support is provided when "AppName" is null or empty.
-# By setting the "AppName" property, Zero-Config MSI will be disabled.
 $adtSession = @{
     # App variables.
     AppVendor = ''
     AppName = ''
     AppVersion = ''
     AppArch = ''
-    AppLang = 'EN'
+    AppLang = ''
     AppRevision = '01'
     AppSuccessExitCodes = @(0)
     AppRebootExitCodes = @(1641, 3010)
-    AppProcessesToClose = @()  # Example: @('excel', @{ Name = 'winword'; Description = 'Microsoft Word' })
+    AppProcessesToClose = @() # Example: @('excel', @{ Name = 'winword'; Description = 'Microsoft Word' })
     AppScriptVersion = '1.0.0'
-    AppScriptDate = '2000-12-31'
-    AppScriptAuthor = '<author name>'
+    AppScriptDate = '' # 'MM/dd/YYYY'
+    AppScriptAuthor = ''
+    AppInstallationsanleitung = '' # Soll über die Eingabemaske mit dem Confluence-Kurzlink befüllt werden
     RequireAdmin = $true
 
     # Install Titles (Only set here to override defaults set by the toolkit).
@@ -109,14 +107,50 @@ $adtSession = @{
     # Script variables.
     DeployAppScriptFriendlyName = $MyInvocation.MyCommand.Name
     DeployAppScriptParameters = $PSBoundParameters
-    DeployAppScriptVersion = '4.2.0'
+    DeployAppScriptVersion = '4.1.7'
 }
-
-
-##================================================
-## MARK: Deployment type definitions
-##================================================
-
+#================================================================================================
+#Region FIRMA-Variablen
+#================================================================================================
+# FIRMA: Globale Variablen, die bei Installation, Reparatur und Deinstallation verwendet werden
+#================================================================================================
+$AppFriendlyName = "$($adtSession.AppVendor) $($adtSession.AppName)"
+$ActiveSetupKey = $AppFriendlyName
+# FIRMA: Zusammengesetzter Paketname (wird für Detection verwendet)
+$PkgLongNameRev = "$($adtSession.AppVendor)_$($adtSession.AppName)_$($adtSession.AppVersion)_$($adtSession.AppArch)_$($adtSession.AppLang)_$($adtSession.AppRevision)"
+$InstalledAppRegKey = "HKLM\SOFTWARE\InstalledApps\$PkgLongNameRev"
+#================================================================================================
+# FIRMA: Variablen zur Steuerung des Paketverhaltens
+#================================================================================================
+# FIRMA: Zusätzliche Parameter für MSI-Installation bei Bedarf erweitern z.B. MSIRESTARTMANAGERCONTROL=Disable MSIDISABLERMRESTART=1
+#       ('REBOOT=ReallySuppress /QN' bereits in config.psd1 definiert )
+$msiFIRMAAdditionalArgumentList = "ALLUSERS=1"
+# FIRMA: Meldungs- und Fortschrittsbalken anzeigen? Yes/No
+$ShowMessages = "Yes"
+# FIRMA: ActiveSetup erneut ausführen, wenn es schon mal z.B. in der Vorgängerversion gelaufen ist? Yes/No
+# "No" entspricht dem Verhalten in DSM, wenn ein Software-Set revisioniert wurde, die USR Komponente jedoch unverändert bleibt.
+$ActiveSetupRunAgain = "Yes"
+#Endregion FIRMA-Variablen
+#================================================================================================
+#Region Anwendungen beenden
+function Get-FIRMAAppsToClose {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [String] $Pfad,
+        [String] $BeschreibungsPrefix
+    )
+    $AppProcessesToClose = New-Object -TypeName "System.Collections.ArrayList"
+    $Programme = Get-ChildItem -Path $Pfad -Filter "*.exe" -Recurse
+    foreach ($Programm in $Programme) {
+        $FullName = $Programm.FullName
+        $Name = "$(($Programm.Name).TrimEnd(",.exe"))"
+        $Beschreibung = "$BeschreibungsPrefix $Name"
+        $AppProcessesToClose.Add( @{ Name = $FullName; Description = $Beschreibung })
+    }
+    return $AppProcessesToClose
+}
+#Endregion Anwendungen beenden
 function Install-ADTDeployment
 {
     [CmdletBinding()]
@@ -129,59 +163,121 @@ function Install-ADTDeployment
     ##================================================
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
 
+    # Entferne letzte gespeicherte Fehlermeldung aus der Registry
+    if ( Test-ADTRegistryValue -Key $InstalledAppRegKey -Name "ExitMessage" ) {
+        Remove-ADTRegistryKey -Key $InstalledAppRegKey -Name "ExitMessage"
+    }
+    # FIRMA: Pfad zum Setup-Protokoll (gilt für setup.exe etc., nicht für MSI )
+    $InstLogPath =   "`"$((Get-ADTConfig).Toolkit.LogPath)\$($adtSession.InstallName)-Install.log`""
+
     ## Show Welcome Message, close processes if specified, allow up to 3 deferrals, verify there is enough disk space to complete the install, and persist the prompt.
+    # FIRMA: Subtitle hinzugefügt
     $saiwParams = @{
         AllowDefer = $true
         DeferTimes = 3
+		CloseProcessesCountdown = 7200 # 120 Minuten
         CheckDiskSpace = $true
         PersistPrompt = $true
+        Subtitle = "FIRMA Softwareverteilung - Installation"
     }
     if ($adtSession.AppProcessesToClose.Count -gt 0)
     {
         $saiwParams.Add('CloseProcesses', $adtSession.AppProcessesToClose)
     }
-    Show-ADTInstallationWelcome @saiwParams
-
-    ## Show Progress Message (with the default message).
-    Show-ADTInstallationProgress
-
+    # FIRMA: Protokollierung der Voreinstellungen zur Benutzerinteraktion
+    Write-ADTLogEntry -Message "Anzeige von Benutzermeldungen: $ShowMessages" -Severity Info  
+	# Zeige das Willkommensfenster nur an, wenn wirklich Prozesse zu beenden sind
+    if ( $adtSession.AppProcessesToClose -and ($null -ne (Get-ADTRunningProcesses -ProcessObjects $adtSession.AppProcessesToClose))) {
+        Show-ADTInstallationWelcome @saiwParams
+    }
+	else {
+        Write-ADTLogEntry -Message "Welcome-Meldung wird nicht angezeigt, weil keine Prozesse zu beenden wird." -Severity Info
+    }	  
+    # FIRMA: Fortschrittsbenachrichtigung anzeigen, falls gewünscht
+    if ($ShowMessages -eq "Yes") {
+        Show-ADTInstallationProgress -Subtitle $saiwParams.Subtitle -StatusMessageDetail "Dieses Fenster wird automatisch geschlossen, wenn die Installation von $($adtSession.AppName) abgeschlossen ist."
+    }
     ## <Perform Pre-Installation tasks here>
-
 
     ##================================================
     ## MARK: Install
     ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
 
-    ## Handle Zero-Config MSI installations.
-    if ($adtSession.UseDefaultMsi)
-    {
-        $ExecuteDefaultMSISplat = @{ Action = $adtSession.DeploymentType; FilePath = $adtSession.DefaultMsiFile }
-        if ($adtSession.DefaultMstFile)
-        {
-            $ExecuteDefaultMSISplat.Add('Transforms', $adtSession.DefaultMstFile)
-        }
-        Start-ADTMsiProcess @ExecuteDefaultMSISplat
-        if ($adtSession.DefaultMspFiles)
-        {
-            $adtSession.DefaultMspFiles | Start-ADTMsiProcess -Action Patch
-        }
-    }
-
     ## <Perform Installation tasks here>
 
-
+    #================================================================================================
+    #Region FIRMA: Benutzerteil (Active Setup)
+    #================================================================================================
+	$InvokeAppDeployToolkitUser = "$PSScriptRoot\User\Invoke-AppDeployToolkit.ps1"
+    # Wenn Benutzerteil vorhanden, dann Active Setup einrichten und ausführen
+    if (Test-Path "$InvokeAppDeployToolkitUser") {
+        Write-ADTLogEntry -Message "Benutzerteil vorhanden - Dateien für ActiveSetup werden kopiert..." -Severity Info
+        $ActiveSetupFolder = "$env:programfiles\FIRMA\ActiveSetup\$ActiveSetupKey"
+        New-ADTFolder -Path $ActiveSetupFolder
+	    # PSAppDeploy Toolkit und  Inhalt des Ordners User kopieren
+        Copy-ADTFile -Path "$PSScriptRoot\Assets" -Destination "$ActiveSetupFolder" -Recurse
+        Copy-ADTFile -Path "$PSScriptRoot\Config" -Destination "$ActiveSetupFolder" -Recurse
+        Copy-ADTFile -Path "$PSScriptRoot\PSAppDeployToolkit" -Destination "$ActiveSetupFolder" -Recurse
+        Copy-ADTFile -Path "$PSScriptRoot\PSAppDeployToolkit.Extensions" -Destination "$ActiveSetupFolder" -Recurse
+        Copy-ADTFile -Path "$PSScriptRoot\Invoke-AppDeployToolkit.exe" -Destination "$ActiveSetupFolder"
+        Copy-ADTFile -Path "$PSScriptRoot\User\Invoke-AppDeployToolkit.ps1" -Destination "$ActiveSetupFolder"
+        if ( Test-Path -Path "$PSScriptRoot\User\Files" ) {
+            Copy-ADTFile -Path "$PSScriptRoot\User\Files" -Destination "$ActiveSetupFolder" -Recurse    
+        }
+        # Active Setup einrichten
+        Write-ADTLogEntry -Message "ActiveSetup wird eingerichtet..." -Severity Info
+        $StubArguments = "/c start `"`" `"$ActiveSetupFolder\Invoke-AppDeployToolkit.exe`" `"-DeployMode Interactive`" "
+        # Ist Active Setup bereits gelaufen?
+        if (Test-ADTRegistryValue -Key "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Active Setup\Installed Components\$ActiveSetupKey" -Name "Version") {
+            # dann Active Setup nur erneut ausführen, wenn dies so gewollt ist
+            Write-ADTLogEntry -Message "ActiveSetup erneut ausführen: $ActiveSetupRunAgain" -Severity Info
+            If ($ActiveSetupRunAgain -eq "Yes") {
+                Set-ADTActiveSetup -StubExePath "$envWindir\System32\cmd.exe" -Key $ActiveSetupKey -Arguments "$StubArguments" -NoExecuteForCurrentUser
+                # Wenn aktuell ein Benutzer angemeldet ist, dann Active Setup sofort ausführen
+                if ($RunAsActiveUser) {
+                    Start-ADTProcessAsUser -FilePath "$envWindir\System32\runonce.exe" -ArgumentList " /AlternateShellStartup"
+                    Start-Sleep -Seconds 10
+                }
+            } else {
+                # Sonst Meldungsfenster ausgeben
+                if ($ShowMessages -eq "Yes") {
+                    Show-ADTInstallationPrompt -Message "Aktualisierung von $AppFriendlyName abgeschlossen." -ButtonMiddleText 'Ok' -NoWait -Subtitle "FIRMA Softwareverteilung - Aktualisierung der Anwendung"
+                }
+            } 
+        } else {
+            # Active Setup erstmalig einrichten
+            Write-ADTLogEntry -Message "ActiveSetup wird erstmalig eingerichtet..." -Severity Info
+            Set-ADTActiveSetup -StubExePath "$envWindir\System32\cmd.exe" -Key $ActiveSetupKey -Arguments "$StubArguments" -NoExecuteForCurrentUser
+            # Wenn aktuell ein Benutzer angemeldet ist, dann Active Setup sofort ausführen
+            if ($RunAsActiveUser) {
+                Write-ADTLogEntry -Message "ActiveSetup wird für den angemeldeten Benutzer sofort ausgeführt..." -Severity Info
+                Start-ADTProcessAsUser -FilePath "$envWindir\System32\runonce.exe" -ArgumentList " /AlternateShellStartup"
+                Start-Sleep -Seconds 10
+            }
+        }
+    } else {
+	    # Sonst Meldungsfenster ausgeben
+        Write-ADTLogEntry -Message "Kein Benutzerteil vorhanden." -Severity Info
+        if ($ShowMessages -eq "Yes") {
+            Show-ADTInstallationPrompt -Message "Installation von $AppFriendlyName abgeschlossen." -ButtonMiddleText 'Ok' -NoWait -Subtitle "FIRMA Softwareverteilung - Installation der Anwendung"
+        }
+    }
+    #Endregion FIRMA: Benutzerteil (Active Setup)
     ##================================================
     ## MARK: Post-Install
     ##================================================
     $adtSession.InstallPhase = "Post-$($adtSession.DeploymentType)"
 
     ## <Perform Post-Installation tasks here>
+    # FIRMA: Registry-Eintrag zur Anwendungserkennung
+	Set-ADTRegistryKey -Key $InstalledAppRegKey -Name "Status" -Value "installiert" -Type String
 
     ## Display a message at the end of the install.
     if (!$adtSession.UseDefaultMsi)
     {
-        Show-ADTInstallationPrompt -Message 'You can customize text to appear at the end of an install or remove it completely for unattended installations.' -ButtonRightText 'OK' -NoWait
+        #FIRMA: Anzeige einer Message steht oben am Ende des Install-Teils (bzw. bei vorhandenem Benutzteil am Ende dessen)
+        #Show-ADTInstallationPrompt -Message 'You can customize text to appear at the end of an install or remove it completely for unattended installations.' -ButtonRightText 'OK' -Icon Information -NoWait
     }
 }
 
@@ -197,43 +293,61 @@ function Uninstall-ADTDeployment
     ##================================================
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
 
+    # Entferne letzte gespeicherte Fehlermeldung aus der Registry
+    if ( Test-ADTRegistryValue -Key $InstalledAppRegKey -Name "ExitMessage" ) {
+        Remove-ADTRegistryKey -Key $InstalledAppRegKey -Name "ExitMessage"
+    }
+
+    # FIRMA: Pfad zum Setup-Protokoll (gilt für setup.exe etc., nicht für MSI )
+    $UninstLogPath = "`"$((Get-ADTConfig).Toolkit.LogPath)\$($adtSession.InstallName)-Uninstall.log`""
+    $saiwParams = @{
+        AllowDefer = $false
+		CloseProcessesCountdown = 300 # 5 Minuten
+        PersistPrompt = $true
+        Subtitle = "FIRMA Softwareverteilung - Deinstallation"
+    }
     ## If there are processes to close, show Welcome Message with a 60 second countdown before automatically closing.
     if ($adtSession.AppProcessesToClose.Count -gt 0)
     {
-        Show-ADTInstallationWelcome -CloseProcesses $adtSession.AppProcessesToClose -CloseProcessesCountdown 60
+        $saiwParams.Add('CloseProcesses', $adtSession.AppProcessesToClose)
+        Show-ADTInstallationWelcome @saiwParams
+    }
+    # FIRMA: Fortschrittsbenachrichtigung anzeigen, falls gewünscht
+    if ($ShowMessages -eq "Yes") {
+        Show-ADTInstallationProgress -Subtitle $saiwParams.Subtitle -StatusMessageDetail "Dieses Fenster wird automatisch geschlossen, wenn die Deinstallation von $($adtSession.AppName) abgeschlossen ist."
     }
 
-    ## Show Progress Message (with the default message).
-    Show-ADTInstallationProgress
-
     ## <Perform Pre-Uninstallation tasks here>
-
 
     ##================================================
     ## MARK: Uninstall
     ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
 
-    ## Handle Zero-Config MSI uninstallations.
-    if ($adtSession.UseDefaultMsi)
-    {
-        $ExecuteDefaultMSISplat = @{ Action = $adtSession.DeploymentType; FilePath = $adtSession.DefaultMsiFile }
-        if ($adtSession.DefaultMstFile)
-        {
-            $ExecuteDefaultMSISplat.Add('Transforms', $adtSession.DefaultMstFile)
-        }
-        Start-ADTMsiProcess @ExecuteDefaultMSISplat
-    }
-
     ## <Perform Uninstallation tasks here>
 
+    ##================================================
+    ## FIRMA: ActiveSetup vollständig entfernen
+    ##================================================
+    Write-ADTLogEntry -Message "ActiveSetup wird für alle User entfernt..." -Severity Info
+	$InvokeAppDeployToolkitUser = "$PSScriptRoot\User\Invoke-AppDeployToolkit.ps1"
+    if (Test-Path "$InvokeAppDeployToolkitUser") {
+	    # ActiveSetup entfernen
+        $ActiveSetupFolder = "$env:programfiles\FIRMA\ActiveSetup\$ActiveSetupKey"
+        Remove-ADTFolder -Path "$ActiveSetupFolder"
+        Set-ADTActiveSetup -Key $ActiveSetupKey -PurgeActiveSetupKey
+    }
+    else {
+        Write-ADTLogEntry -Message "$InvokeAppDeployToolkitUser nicht vorhanden" -Severity Warning    
+    }
 
     ##================================================
     ## MARK: Post-Uninstallation
     ##================================================
     $adtSession.InstallPhase = "Post-$($adtSession.DeploymentType)"
-
     ## <Perform Post-Uninstallation tasks here>
+    # FIRMA: Registry-Eintrag zur Anwendungserkennung
+    Set-ADTRegistryKey -Key $InstalledAppRegKey -Name "Status" -Value "deinstalliert" -Type String									
 }
 
 function Repair-ADTDeployment
@@ -248,36 +362,43 @@ function Repair-ADTDeployment
     ##================================================
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
 
-    ## If there are processes to close, show Welcome Message with a 60 second countdown before automatically closing.
-    if ($adtSession.AppProcessesToClose.Count -gt 0)
-    {
-        Show-ADTInstallationWelcome -CloseProcesses $adtSession.AppProcessesToClose -CloseProcessesCountdown 60
+    # Entferne letzte gespeicherte Fehlermeldung aus der Registry
+    if ( Test-ADTRegistryValue -Key $InstalledAppRegKey -Name "ExitMessage" ) {
+        Remove-ADTRegistryKey -Key $InstalledAppRegKey -Name "ExitMessage"
     }
 
-    ## Show Progress Message (with the default message).
-    Show-ADTInstallationProgress
-
+    # FIRMA: Pfad zum Setup-Protokoll (gilt für setup.exe etc., nicht für MSI )
+    $UninstLogPath = "`"$((Get-ADTConfig).Toolkit.LogPath)\$($adtSession.InstallName)-Uninstall.log`""	
+    $InstLogPath =   "`"$((Get-ADTConfig).Toolkit.LogPath)\$($adtSession.InstallName)-Install.log`""
+	
+    $saiwParams = @{
+        AllowDefer = $false
+		CloseProcessesCountdown = 300 # 5 Minuten
+        PersistPrompt = $true
+        Subtitle = "FIRMA Softwareverteilung - Reparatur"
+    }
+    ## If there are processes to close, show Welcome Message with a 60 second countdown before automatically closing.
+    # FIRMA: Protokollierung der Voreinstellungen zur Benutzerinteraktion
+    Write-ADTLogEntry -Message "Anzeige von Benutzermeldungen: $ShowMessages" -Severity Info  
+	# Zeige das Willkommensfenster nur an, wenn wirklich Prozesse zu beenden sind
+    if ( $adtSession.AppProcessesToClose -and ($null -ne (Get-ADTRunningProcesses -ProcessObjects $adtSession.AppProcessesToClose))) {
+        Show-ADTInstallationWelcome @saiwParams
+    }
+	else {
+        Write-ADTLogEntry -Message "Welcome-Meldung wird nicht angezeigt, weil keine Prozesse zu beenden wird." -Severity Info
+    }	  
+    # FIRMA: Fortschrittsbenachrichtigung anzeigen, falls gewünscht	
+    if ($ShowMessages -eq "Yes") {
+        Show-ADTInstallationProgress -Subtitle $saiwParams.Subtitle -StatusMessageDetail "Dieses Fenster wird automatisch geschlossen, wenn die Reparatur von $($adtSession.AppName) abgeschlossen ist."
+    }
     ## <Perform Pre-Repair tasks here>
-
 
     ##================================================
     ## MARK: Repair
     ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
 
-    ## Handle Zero-Config MSI repairs.
-    if ($adtSession.UseDefaultMsi)
-    {
-        $ExecuteDefaultMSISplat = @{ Action = $adtSession.DeploymentType; FilePath = $adtSession.DefaultMsiFile }
-        if ($adtSession.DefaultMstFile)
-        {
-            $ExecuteDefaultMSISplat.Add('Transforms', $adtSession.DefaultMstFile)
-        }
-        Start-ADTMsiProcess @ExecuteDefaultMSISplat
-    }
-
     ## <Perform Repair tasks here>
-
 
     ##================================================
     ## MARK: Post-Repair
@@ -285,8 +406,9 @@ function Repair-ADTDeployment
     $adtSession.InstallPhase = "Post-$($adtSession.DeploymentType)"
 
     ## <Perform Post-Repair tasks here>
+    # FIRMA: Registry-Eintrag zur Anwendungserkennung
+    Set-ADTRegistryKey -Key $InstalledAppRegKey -Name "Status" -Value "installiert" -Type String									
 }
-
 
 ##================================================
 ## MARK: Initialization
@@ -301,20 +423,22 @@ Set-StrictMode -Version 1
 try
 {
     # Import the module locally if available, otherwise try to find it from PSModulePath.
-    if (Test-Path -LiteralPath "$PSScriptRoot\..\..\..\PSAppDeployToolkit\PSAppDeployToolkit.psd1" -PathType Leaf)
+    if (Test-Path -LiteralPath "$PSScriptRoot\PSAppDeployToolkit\PSAppDeployToolkit.psd1" -PathType Leaf)
     {
-        Get-ChildItem -LiteralPath "$PSScriptRoot\..\..\..\PSAppDeployToolkit" -Recurse -File | Unblock-File -ErrorAction Ignore
-        Import-Module -FullyQualifiedName @{ ModuleName = [System.Management.Automation.WildcardPattern]::Escape("$PSScriptRoot\..\..\..\PSAppDeployToolkit\PSAppDeployToolkit.psd1"); Guid = '8c3c366b-8606-4576-9f2d-4051144f7ca2'; ModuleVersion = '4.2.0' } -Force
+        Get-ChildItem -LiteralPath "$PSScriptRoot\PSAppDeployToolkit" -Recurse -File | Unblock-File -ErrorAction Ignore
+        Import-Module -FullyQualifiedName @{ ModuleName = "$PSScriptRoot\PSAppDeployToolkit\PSAppDeployToolkit.psd1"; Guid = '8c3c366b-8606-4576-9f2d-4051144f7ca2'; ModuleVersion = '4.1.7' } -Force
     }
     else
     {
-        Import-Module -FullyQualifiedName @{ ModuleName = 'PSAppDeployToolkit'; Guid = '8c3c366b-8606-4576-9f2d-4051144f7ca2'; ModuleVersion = '4.2.0' } -Force
+        Import-Module -FullyQualifiedName @{ ModuleName = 'PSAppDeployToolkit'; Guid = '8c3c366b-8606-4576-9f2d-4051144f7ca2'; ModuleVersion = '4.1.7' } -Force
     }
 
     # Open a new deployment session, replacing $adtSession with a DeploymentSession.
     $iadtParams = Get-ADTBoundParametersAndDefaultValues -Invocation $MyInvocation
     $adtSession = Remove-ADTHashtableNullOrEmptyValues -Hashtable $adtSession
-    $adtSession = Open-ADTSession @adtSession @iadtParams -PassThru
+    <# FIRMA: Option -NoProcessDetection hinzugefügt, damit die Session nicht in den Silent-Mode umschaltet, wenn keine zu beendenden
+       Prozesse gefunden werden. #>
+    $adtSession = Open-ADTSession @adtSession @iadtParams -PassThru -NoProcessDetection
 }
 catch
 {
@@ -337,7 +461,7 @@ try
             if ($_.Name -match 'PSAppDeployToolkit\..+$')
             {
                 Get-ChildItem -LiteralPath $_.FullName -Recurse -File | Unblock-File -ErrorAction Ignore
-                Import-Module -Name ([System.Management.Automation.WildcardPattern]::Escape("$($_.FullName)\$($_.BaseName).psd1")) -Force
+                Import-Module -Name $_.FullName -Force
             }
         }
     }
@@ -350,13 +474,16 @@ catch
 {
     # An unhandled error has been caught.
     $mainErrorMessage = "An unhandled error within [$($MyInvocation.MyCommand.Name)] has occurred.`n$(Resolve-ADTErrorRecord -ErrorRecord $_)"
-    Write-ADTLogEntry -Message $mainErrorMessage -Severity Error
+    Write-ADTLogEntry -Message $mainErrorMessage -Severity 3
 
     ## Error details hidden from the user by default. Show a simple dialog with full stack trace:
     # Show-ADTDialogBox -Text $mainErrorMessage -Icon Stop -NoWait
 
     ## Or, a themed dialog with basic error message:
-    # Show-ADTInstallationPrompt -Message "$($adtSession.DeploymentType) failed at line $($_.InvocationInfo.ScriptLineNumber), char $($_.InvocationInfo.OffsetInLine):`n$($_.InvocationInfo.Line.Trim())`n`nMessage:`n$($_.Exception.Message)" -ButtonRightText OK -Icon Error -NoWait
+    # Show-ADTInstallationPrompt -Message "$($adtSession.DeploymentType) failed at line $($_.InvocationInfo.ScriptLineNumber), char $($_.InvocationInfo.OffsetInLine):`n$($_.InvocationInfo.Line.Trim())`n`nMessage:`n$($_.Exception.Message)" -MessageAlignment Left -ButtonRightText OK -Icon Error -NoWait
 
+    # FIRMA: Schreibe die Fehlermeldung in der Registry zur Übergabe an DSM
+    Write-FIRMADSMErrorMessage
     Close-ADTSession -ExitCode 60001
 }
+
